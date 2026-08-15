@@ -1,0 +1,592 @@
+import builtins
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
+
+import torch
+import executorch.backends.qualcomm.qnn_preprocess as qnn_preprocess
+from executorch.backends.qualcomm._passes import (
+    AnnotateQuantAttrs,
+    ConvertBmmToMatmul,
+    ConvertMhaToSha,
+    FoldQDQ,
+    InsertIOQDQ,
+    InsertReshapeForReduceOps,
+    RemoveRedundancy,
+)
+from executorch.backends.qualcomm._passes.qnn_pass_manager import (
+    get_qnn_pass_manager_cls,
+)
+from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
+from executorch.backends.qualcomm.partition.qnn_partitioner import QnnOperatorSupport
+from executorch.backends.qualcomm.qnn_preprocess import QnnBackend
+from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
+from executorch.backends.qualcomm.serialization.qc_schema import (
+    QcomChipset,
+    QnnExecuTorchBackendType,
+)
+from executorch.backends.qualcomm.tests.models import (
+    HardSigmoid,
+    Reciprocal,
+    TopKandIndex,
+)
+from executorch.backends.qualcomm.utils.utils import (
+    generate_htp_compiler_spec,
+    generate_qnn_executorch_compiler_spec,
+    to_edge_transform_and_lower_to_qnn,
+)
+from executorch.exir import EdgeCompileConfig, to_edge
+from executorch.exir.debug_handle_utils import DEBUG_HANDLE_KEY
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.library import Library
+from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+
+
+class TestPasses(unittest.TestCase):
+    def test_online_prepare_multimethod_compiles_one_dlc_per_method(self):
+        option = SimpleNamespace(
+            online_prepare=True,
+            backend_options=SimpleNamespace(
+                backend_type=QnnExecuTorchBackendType.kGpuBackend
+            ),
+            op_package_options=SimpleNamespace(op_package_infos=[]),
+            use_mha2sha=False,
+            saver=False,
+        )
+        manager = MagicMock()
+        manager.IsTensorDump.return_value = False
+        manager.Compile.side_effect = lambda graph_names, _: (
+            f"dlc:{graph_names[0]}".encode()
+        )
+        wrapper = MagicMock()
+        programs = {"method_a": [object()], "method_b": [object()]}
+        spec = MagicMock(value=b"compile_spec")
+        compile_specs = {name: [[spec]] for name in programs}
+
+        with (
+            patch(
+                "executorch.backends.qualcomm.qnn_preprocess.flatbuffer_to_option",
+                return_value=option,
+            ),
+            patch(
+                "executorch.backends.qualcomm.qnn_preprocess.get_current_qnn_manager",
+                return_value=manager,
+            ),
+            patch.object(QnnBackend, "_build_op_wrappers", return_value=[wrapper]),
+        ):
+            result = QnnBackend.preprocess_multimethod(programs, compile_specs)
+
+        self.assertEqual(result["method_a"][0].processed_bytes, b"dlc:method_a")
+        self.assertEqual(result["method_b"][0].processed_bytes, b"dlc:method_b")
+        manager.InitContext.assert_has_calls([call(["method_a"]), call(["method_b"])])
+        self.assertEqual(manager.Compile.call_count, 2)
+        self.assertEqual(manager.DestroyContext.call_count, 2)
+
+    def test_offline_multimethod_keeps_shared_context_binary(self):
+        option = SimpleNamespace(
+            online_prepare=False,
+            backend_options=SimpleNamespace(
+                backend_type=QnnExecuTorchBackendType.kHtpBackend
+            ),
+            op_package_options=SimpleNamespace(op_package_infos=[]),
+            use_mha2sha=False,
+            saver=False,
+        )
+        manager = MagicMock()
+        manager.IsTensorDump.return_value = False
+        manager.Compile.return_value = b"shared_context"
+        wrapper = MagicMock()
+        programs = {"method_a": [object()], "method_b": [object()]}
+        spec = MagicMock(value=b"compile_spec")
+        compile_specs = {name: [[spec]] for name in programs}
+
+        with (
+            patch(
+                "executorch.backends.qualcomm.qnn_preprocess.flatbuffer_to_option",
+                return_value=option,
+            ),
+            patch(
+                "executorch.backends.qualcomm.qnn_preprocess.get_current_qnn_manager",
+                return_value=manager,
+            ),
+            patch.object(QnnBackend, "_build_op_wrappers", return_value=[wrapper]),
+        ):
+            result = QnnBackend.preprocess_multimethod(programs, compile_specs)
+
+        self.assertEqual(
+            result["method_a"][0].processed_bytes,
+            result["method_b"][0].processed_bytes,
+        )
+        manager.InitContext.assert_called_once_with(["method_a", "method_b"])
+        manager.Compile.assert_called_once()
+        manager.DestroyContext.assert_called_once()
+
+    def test_hf_rope_buffers_are_contiguous(self):
+        from executorch.examples.models.llama.model_args import ModelArgs
+        from executorch.examples.models.llama.rope import hf_precompute_freqs_cis
+        from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
+            LlamaModel,
+        )
+
+        args = ModelArgs(
+            dim=8,
+            hidden_dim=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            head_dim=4,
+            vocab_size=16,
+            max_seq_len=8,
+            max_context_len=8,
+            use_hf_rope=True,
+        )
+        model = LlamaModel(args)
+        self.assertTrue(model.freqs_cos.is_contiguous())
+        self.assertTrue(model.freqs_sin.is_contiguous())
+        expected_cos, expected_sin = hf_precompute_freqs_cis(
+            args.head_dim,
+            args.max_context_len,
+            args.rope_freq_base,
+            args.partial_rotary_factor,
+        )
+        torch.testing.assert_close(
+            model.freqs_cos, expected_cos[:, : expected_cos.shape[-1] // 2]
+        )
+        torch.testing.assert_close(
+            model.freqs_sin, expected_sin[:, : expected_sin.shape[-1] // 2]
+        )
+
+    def _build_context_loader_edge_program(self, op_name, check_ir_validity=True):
+        graph_name = "forward"
+        custom_op = Library(OpContextLoader.namespace, "FRAGMENT")
+        self.addCleanup(custom_op._destroy)
+        custom_op.define(f"{op_name}(Tensor[] inputs) -> Any")
+
+        @torch.library.impl(
+            custom_op, op_name, dispatch_key="CompositeExplicitAutograd"
+        )
+        def op_impl(inputs):
+            return (torch.zeros((1, 2), device="meta", dtype=inputs[0].dtype),)
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return getattr(
+                    getattr(torch.ops, OpContextLoader.namespace), op_name
+                ).default((x,))
+
+        exported_program = torch.export.export(
+            Model(), (torch.ones(1, 2),), strict=True
+        )
+        compile_config = (
+            None if check_ir_validity else EdgeCompileConfig(_check_ir_validity=False)
+        )
+        edge_program_manager = to_edge(
+            {graph_name: exported_program},
+            compile_config=compile_config,
+        )
+        edge_program = edge_program_manager._edge_programs[graph_name]
+        context_loader_nodes = [
+            node
+            for node in edge_program.graph.nodes
+            if node.op == "call_function"
+            and OpContextLoader.namespace in str(node.target)
+        ]
+        return edge_program, context_loader_nodes
+
+    def test_context_loader_edge_op_is_delegated(self):
+        op_name = "ctx_loader_delegation"
+        ctx_bin = b"qnn_context_binary"
+        _, context_loader_nodes = self._build_context_loader_edge_program(
+            op_name, check_ir_validity=False
+        )
+        self.assertEqual(1, len(context_loader_nodes))
+        context_loader_nodes[0].meta[OpContextLoader.meta_ctx_bin] = ctx_bin
+
+        # A fully constructed QnnOperatorSupport needs a live QNN manager, so
+        # drive is_node_supported with a mock self: the context-loader node is
+        # force-passed without touching instance state beyond the log label.
+        support = MagicMock()
+        support.phase = "QnnPartitioner"
+        self.assertTrue(
+            QnnOperatorSupport.is_node_supported(support, None, context_loader_nodes[0])
+        )
+
+    def test_build_op_wrappers_returns_context_binary(self):
+        op_name = "ctx_loader_build"
+        ctx_bin = b"qnn_context_binary"
+        edge_program, context_loader_nodes = self._build_context_loader_edge_program(
+            op_name, check_ir_validity=False
+        )
+        for node in context_loader_nodes:
+            node.meta[OpContextLoader.meta_ctx_bin] = ctx_bin
+
+        # For a graph whose only op is the context-binary loader, _build_op_wrappers
+        # returns the stamped context binary directly, before any QNN compilation.
+        result = QnnBackend._build_op_wrappers(
+            edge_program,
+            enable_tensor_dump=False,
+            op_package_infos=[],
+            use_mha2sha=False,
+            backend_type=QnnExecuTorchBackendType.kHtpBackend,
+        )
+        self.assertEqual(ctx_bin, result)
+        self.assertIs(getattr(qnn_preprocess, "range", builtins.range), builtins.range)
+
+    def test_context_loader_op_lowers_with_ir_validation(self):
+        op_name = "ctx_loader_validation"
+
+        # from_context_binary lowers with IR validity checks enabled (the
+        # default). The context-loader custom op survives the edge verifier
+        # because its namespace is not aten, so no validation is disabled and
+        # the loader node is still present for downstream stamping.
+        _, context_loader_nodes = self._build_context_loader_edge_program(
+            op_name, check_ir_validity=True
+        )
+        self.assertEqual(1, len(context_loader_nodes))
+
+    def _build_quantized_graph(self):
+        """Build a quantized graph through AnnotateQuantAttrs + FoldQDQ."""
+
+        class AddModule(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        module = AddModule().eval()
+        sample_input = (torch.randn(1, 4),)
+
+        exported = torch.export.export(module, sample_input, strict=True).module()
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(quant_dtype=QuantDtype.use_8a8w)
+        prepared = prepare_pt2e(exported, quantizer)
+        prepared(*sample_input)
+        qdq_module = convert_pt2e(prepared)
+
+        edge_program = to_edge(
+            torch.export.export(qdq_module, sample_input, strict=True)
+        )
+        ep = edge_program.exported_program()
+        gm = ep.graph_module
+
+        gm = AnnotateQuantAttrs(ep)(gm).graph_module
+        gm = FoldQDQ(ep)(gm).graph_module
+        return gm, ep
+
+    def test_insert_io_qdq_handles_dequant_encoding(self):
+        """InsertIOQDQ should not KeyError when a node with a dequantize
+        encoding feeds the output node (e.g. pre-quantized LLM parameters)."""
+        gm, ep = self._build_quantized_graph()
+
+        # Wire b__frozen_param0 (which has dequantize encoding) to output,
+        # simulating the LLM topology from github issue #17732.
+        param_node = None
+        output_node = None
+        for n in gm.graph.nodes:
+            if n.name == "b__frozen_param0":
+                param_node = n
+            if n.op == "output":
+                output_node = n
+
+        self.assertIsNotNone(param_node)
+        old_args = output_node.args[0]
+        output_node.args = (
+            ((old_args,) if not isinstance(old_args, tuple) else old_args)
+            + (param_node,),
+        )
+        gm.graph.lint()
+        gm.recompile()
+
+        pass_instance = InsertIOQDQ(ep)
+        pass_instance._insert(gm)
+
+        dq_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and hasattr(n.target, "__name__")
+            and "dequantize" in n.target.__name__
+            and any(u.op == "output" for u in n.users.keys())
+        ]
+        self.assertGreaterEqual(len(dq_nodes), 1)
+
+    def test_insert_io_qdq_no_revisit(self):
+        """InsertIOQDQ must not revisit newly inserted nodes."""
+        gm, ep = self._build_quantized_graph()
+
+        node_count_before = len(list(gm.graph.nodes))
+        pass_instance = InsertIOQDQ(ep)
+        pass_instance._insert(gm)
+        node_count_after = len(list(gm.graph.nodes))
+
+        # AddModule with one input and one output should insert exactly
+        # one quantize (input) and one dequantize (output) = +2 nodes.
+        self.assertEqual(node_count_after, node_count_before + 2)
+
+    def test_insert_reshape_for_argmax(self):
+        class ArgmaxModule(torch.nn.Module):
+            def forward(self, x):
+                return torch.argmax(x, dim=None)
+
+        mod = ArgmaxModule()
+
+        x = torch.tensor([[1.0, 5.0], [3.0, 2.0]])
+        ep = torch.export.export(mod, (x,))
+        # Run original module for reference
+        ref = mod(x)
+
+        reshape_nodes = [
+            n for n in ep.graph.nodes if n.target == torch.ops.aten.reshape.default
+        ]
+        argmax_nodes = [
+            n for n in ep.graph.nodes if n.target == torch.ops.aten.argmax.default
+        ]
+        self.assertTrue(len(reshape_nodes) == 0, "Reshape node not inserted")
+        self.assertTrue(len(argmax_nodes) == 1, "Argmax node missing")
+
+        InsertReshapeForReduceOps()(ep.graph_module)
+
+        out = ep.graph_module(x)
+
+        # Check graph structure: argmax should take a reshape as input
+        reshape_nodes = [
+            n for n in ep.graph.nodes if n.target == torch.ops.aten.reshape.default
+        ]
+        argmax_nodes = [
+            n for n in ep.graph.nodes if n.target == torch.ops.aten.argmax.default
+        ]
+        self.assertTrue(len(reshape_nodes) == 1, "Reshape node should be inserted")
+        self.assertTrue(len(argmax_nodes) == 1, "Argmax node missing")
+
+        argmax_node = argmax_nodes[0]
+        self.assertEqual(argmax_node.args[1], 0, "Argmax dim not set to 0")
+
+        # Execute new graph and compare with reference
+        out = ep.graph_module(x)
+        self.assertTrue(
+            torch.equal(*out, ref), f"Output mismatch: got {out}, expected {ref}"
+        )
+
+    def test_mha_to_sha(self):
+        from executorch.backends.qualcomm.utils.utils import convert_linear_to_conv2d
+        from executorch.examples.models.llama.model_args import ModelArgs
+        from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
+            CausalAttentionMask,
+        )
+        from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
+            LlamaAttention,
+        )
+
+        # Initailize model config
+        args = ModelArgs()
+        args.max_seq_len = 128
+        args.max_context_len = 128
+        args.ar_len = 32
+        args.use_kv_cache = True
+        args.dim = 32
+        args.n_heads = 8
+        args.n_kv_heads = 8
+        args.n_layers = 2
+        args.head_dim = args.dim // args.n_heads
+        mod = convert_linear_to_conv2d(LlamaAttention(0, args, True))
+
+        # Prepare inputs
+        hidden_states = torch.randn(args.max_batch_size, args.ar_len, args.dim)
+        freqs_cos = torch.randn(args.ar_len, 1)
+        freqs_sin = torch.randn(args.ar_len, 1)
+        atten_mask = CausalAttentionMask(
+            args.max_batch_size, args.ar_len, args.max_seq_len
+        )
+        k_cache = torch.zeros(
+            args.max_batch_size,
+            args.n_kv_heads,
+            args.head_dim,
+            args.max_seq_len - args.ar_len,
+        )
+
+        v_cache = torch.zeros(
+            args.max_batch_size,
+            args.n_kv_heads,
+            args.max_seq_len - args.ar_len,
+            args.head_dim,
+        )
+        sample_input = (
+            hidden_states,
+            freqs_cos,
+            freqs_sin,
+            atten_mask.mask,
+            k_cache,
+            v_cache,
+        )
+
+        # Run original module for reference
+        refs = mod(*sample_input)
+
+        # Export the module and convert linear to conv2d
+        edge_program = to_edge(torch.export.export(mod, sample_input))
+        new_ep = edge_program.exported_program()
+
+        conv_nodes = [
+            n
+            for n in new_ep.graph.nodes
+            if n.target == exir_ops.edge.aten.convolution.default
+        ]
+        # WQ, WK, WV, O
+        self.assertTrue(len(conv_nodes) == 4, "Convolution nodes missing")
+
+        # Convert MHA to SHA
+        # This is a simplified version of what happens in the full pipeline to test the core functionality
+        graph_module = RemoveRedundancy(quantization_capture=False)(
+            new_ep.graph_module
+        ).graph_module
+        graph_module = ConvertBmmToMatmul()(graph_module).graph_module
+        graph_module = ConvertMhaToSha(new_ep)(graph_module).graph_module
+
+        conv_nodes = [
+            n
+            for n in new_ep.graph.nodes
+            if n.target == exir_ops.edge.aten.convolution.default
+        ]
+        # Check graph structure: WQ, WK, WV should be converted to SHA
+        self.assertTrue(len(conv_nodes) == 25, "Convolution nodes should be splited")
+
+        # Execute new graph and compare with reference
+        outs = graph_module(
+            *new_ep.state_dict.values(), *new_ep.constants.values(), *sample_input
+        )
+        for i, (out, ref) in enumerate(zip(outs, refs)):
+            self.assertTrue(
+                torch.allclose(out, *ref, rtol=1e-6, atol=1e-6),
+                f"Output {i} mismatch: got {out}, expected {ref}",
+            )
+
+    def test_resolve_debug_handle(self):
+        name_handle_map = {
+            "aten_topk_default": 1,
+            "getitem": 1,
+            "getitem_1": 1,
+            "aten_view_copy_default": 2,
+            "aten_index_tensor": 3,
+            "aten_add_tensor": 4,
+        }
+        module = TopKandIndex()  # noqa: F405
+        sample_input = (torch.randn(3, 10),)
+
+        backend_options = generate_htp_compiler_spec(use_fp16=False)
+        compiler_spec = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,  # Random soc_model
+            backend_options=backend_options,
+            dump_intermediate_outputs=True,
+        )
+
+        try:
+            edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+                module,
+                sample_input,
+                compiler_spec,
+                generate_etrecord=True,
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        exec_prog_mgr = edge_prog_mgr.to_executorch()
+        etrecord = exec_prog_mgr.get_etrecord()
+        debug_handle_size = len(etrecord._debug_handle_map["forward"][0])
+        self.assertEqual(
+            len(name_handle_map),
+            debug_handle_size,
+            f"Number of handles does not match, expecting: {len(name_handle_map)}, but get: {debug_handle_size}",
+        )
+        after_edge_pass_ep = etrecord.graph_map["edge_after_transform/forward"]
+
+        for node in after_edge_pass_ep.graph.nodes:
+            if node.name in name_handle_map:
+                expected_handle = name_handle_map.pop(node.name)
+                node_handle = node.meta[DEBUG_HANDLE_KEY]
+                self.assertEqual(
+                    expected_handle,
+                    node_handle,
+                    f"{node.name} is expecting a handle id {expected_handle}, but got {node_handle}.",
+                )
+        self.assertEqual(
+            len(name_handle_map),
+            0,
+            f"Following nodes did not find a match in the graph: {name_handle_map.keys()}",
+        )
+
+    def test_decompose_reciprocal_backend_aware(self):
+        sample_input = (torch.tensor([2.0]),)
+        target = torch.ops.aten.reciprocal.default
+        decomposed_backends = (
+            QnnExecuTorchBackendType.kHtpBackend,
+            QnnExecuTorchBackendType.kGpuBackend,
+            QnnExecuTorchBackendType.kLpaiBackend,
+        )
+        preserved_backends = (QnnExecuTorchBackendType.kUndefinedBackend,)
+
+        for backend, should_decompose in [
+            *[(b, True) for b in decomposed_backends],
+            *[(b, False) for b in preserved_backends],
+        ]:
+            # The annotation pipeline is skipped for the GPU backend, as it does not support quantized data types
+            pipelines = (
+                ("export",)
+                if backend == QnnExecuTorchBackendType.kGpuBackend
+                else ("annotation", "export")
+            )
+            for pipeline in pipelines:
+                with self.subTest(backend=backend, pipeline=pipeline):
+                    ep = torch.export.export(Reciprocal(), sample_input, strict=True)
+                    pm = get_qnn_pass_manager_cls(backend)()
+                    if pipeline == "annotation":
+                        pm.transform_for_annotation_pipeline(ep.graph_module)
+                    else:
+                        pm.transform_for_export_pipeline(ep)
+                    has_target = any(
+                        n.target == target for n in ep.graph_module.graph.nodes
+                    )
+                    self.assertNotEqual(
+                        has_target,
+                        should_decompose,
+                        f"reciprocal {'should' if should_decompose else 'should NOT'} be decomposed for {backend.name}",
+                    )
+
+    def test_decompose_hardsigmoid_backend_aware(self):
+        sample_input = (torch.tensor([2.0]),)
+        target = torch.ops.aten.hardsigmoid.default
+        decomposed_backends = (QnnExecuTorchBackendType.kLpaiBackend,)
+        preserved_backends = (
+            QnnExecuTorchBackendType.kGpuBackend,
+            QnnExecuTorchBackendType.kHtpBackend,
+            QnnExecuTorchBackendType.kUndefinedBackend,
+        )
+
+        for backend, should_decompose in [
+            *[(b, True) for b in decomposed_backends],
+            *[(b, False) for b in preserved_backends],
+        ]:
+            # The annotation pipeline is skipped for the GPU backend, as it does not support quantized data types
+            pipelines = (
+                ("export",)
+                if backend == QnnExecuTorchBackendType.kGpuBackend
+                else ("annotation", "export")
+            )
+            for pipeline in pipelines:
+                with self.subTest(backend=backend, pipeline=pipeline):
+                    ep = torch.export.export(HardSigmoid(), sample_input, strict=True)
+                    pm = get_qnn_pass_manager_cls(backend)()
+                    if pipeline == "annotation":
+                        pm.transform_for_annotation_pipeline(ep.graph_module)
+                    else:
+                        pm.transform_for_export_pipeline(ep)
+                    has_target = any(
+                        n.target == target for n in ep.graph_module.graph.nodes
+                    )
+                    self.assertNotEqual(
+                        has_target,
+                        should_decompose,
+                        f"hardsigmoid {'should' if should_decompose else 'should NOT'} be decomposed for {backend.name}",
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()
