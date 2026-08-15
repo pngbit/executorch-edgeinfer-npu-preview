@@ -32,8 +32,8 @@ Attention 始终由静态图执行；部署前离线实测 Query 行数 `R`、�
 
 公开稿 PDF：
 
-> [*EdgeInfer: Hardware-Aware Efficient Execution Planning for High-Performance
-> LLM Inference on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
+> [*EdgeInfer: Hardware-Aware Efficient Execution Planning for a
+> High-Performance LLM Inference Engine on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
 
 实验以单个 Transformer decoder block 为单位，最大上下文为 40,960 tokens，采用 W16A16
 IEEE FP16 和 QNN HTP 后端。`Fixed` 是 ExecuTorch 最大上下文基线

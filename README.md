@@ -39,8 +39,8 @@ host memory, integer ranges, and application policy remain practical limits.
 
 The public manuscript is available here:
 
-> [*EdgeInfer: Hardware-Aware Efficient Execution Planning for High-Performance
-> LLM Inference on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
+> [*EdgeInfer: Hardware-Aware Efficient Execution Planning for a
+> High-Performance LLM Inference Engine on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
 
 The setup uses one Transformer decoder block, a 40,960-token maximum
 context, W16A16 IEEE FP16, and the QNN HTP backend. `Fixed` is the ExecuTorch
