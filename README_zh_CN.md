@@ -28,6 +28,33 @@ Attention 始终由静态图执行；部署前离线实测 Query 行数 `R`、�
 导出的 portfolio 没有预编译的最大 context 字段，但设备内存、主机内存、整数
 范围和应用策略仍然是实际限制。
 
+## 论文与详细结果
+
+公开稿 PDF：
+
+> [*EdgeInfer: Hardware-Aware Execution Planning for an Efficient,
+> High-Performance LLM Inference Engine on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
+
+实验以单个 Transformer decoder block 为单位，最大上下文为 40,960 tokens，采用 W16A16
+IEEE FP16 和 QNN HTP 后端。`Fixed` 是 ExecuTorch 最大上下文基线
+（`Cmax=40960`），不进行在线重编译。测试设备为 Xiaomi 13（SM8550、HTP
+V73、Android 13）和 OnePlus 12（SM8650、HTP V75、Android 16）；导出与部署
+使用 Qualcomm AI Runtime 2.43.0 和 Qualcomm AI Engine Direct 2.18.0。
+
+| 设备 | 阶段 | Fixed | EdgeInfer | 加速比 |
+| --- | --- | ---: | ---: | ---: |
+| Xiaomi 13 SM8550 | Decode | 2363.900 ms | 30.733 ms | 76.9x |
+| Xiaomi 13 SM8550 | Prefill | 785.422 s | 20.060 s | 39.2x |
+| OnePlus 12 SM8650 | Decode | 1994.460 ms | 21.343 ms | 93.4x |
+| OnePlus 12 SM8650 | Prefill | 686.916 s | 14.779 s | 46.5x |
+
+在 40K Decode 下，论文报告 Xiaomi 13 的 1-8 个 decoder blocks 保持
+68-76.9x 加速，OnePlus 12 的 1-32 个 blocks 保持 77-97x 加速；其中
+OnePlus 12 的 32-block 用例从 64.534 s 降至 0.829 s（78x）。完整的 1K-40K
+测量、硬件代价热图、组件耗时拆解和消融实验请参考 PDF 中的 Tables 1-3 与
+Figures 3-6。这些是 decoder-block/Attention 测量，不代表某个具名完整 LLM
+的端到端结果。
+
 ## 环境要求
 
 - Linux 开发机；
@@ -49,7 +76,7 @@ export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LD_LIBRARY_PATH"
 ```
 
 Qualcomm 原始导出和部署流程见
-[`docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md`](../source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md)。
+[`docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md`](docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md)。
 
 ## 1. 探测候选宽度
 

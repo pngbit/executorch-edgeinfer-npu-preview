@@ -35,6 +35,34 @@ The extension is incremental:
 The exported portfolio has no compiled maximum-context field. Device memory,
 host memory, integer ranges, and application policy remain practical limits.
 
+## Paper and Detailed Results
+
+The public manuscript is available here:
+
+> [*EdgeInfer: Hardware-Aware Execution Planning for an Efficient,
+> High-Performance LLM Inference Engine on Static-Graph Edge NPUs*](docs/paper/EdgeInfer_Preprint.pdf)
+
+The setup uses one Transformer decoder block, a 40,960-token maximum
+context, W16A16 IEEE FP16, and the QNN HTP backend. `Fixed` is the ExecuTorch
+maximum-context baseline (`Cmax=40960`), with no online recompilation. The test
+devices are a Xiaomi 13 (SM8550, HTP V73, Android 13) and a OnePlus 12 (SM8650,
+HTP V75, Android 16); export and deployment use Qualcomm AI Runtime 2.43.0 and
+Qualcomm AI Engine Direct 2.18.0.
+
+| Device | Phase | Fixed | EdgeInfer | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| Xiaomi 13 SM8550 | Decode | 2363.900 ms | 30.733 ms | 76.9x |
+| Xiaomi 13 SM8550 | Prefill | 785.422 s | 20.060 s | 39.2x |
+| OnePlus 12 SM8650 | Decode | 1994.460 ms | 21.343 ms | 93.4x |
+| OnePlus 12 SM8650 | Prefill | 686.916 s | 14.779 s | 46.5x |
+
+At 40K Decode, the paper reports 68-76.9x across 1-8 decoder blocks on Xiaomi
+13 and 77-97x across 1-32 blocks on OnePlus 12; the 32-block OnePlus case falls
+from 64.534 s to 0.829 s (78x). See Tables 1-3 and Figures 3-6 in the PDF for
+the complete 1K-40K measurements, hardware-cost heatmaps, component breakdown,
+and ablations. These are decoder-block/Attention measurements, not an
+end-to-end result for a named full LLM.
+
 ## Prerequisites
 
 - Linux development host.
@@ -59,7 +87,7 @@ export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LD_LIBRARY_PATH"
 ```
 
 The standard Qualcomm setup remains documented in
-[`docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md`](../source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md).
+[`docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md`](docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md).
 
 ## 1. Select Candidate Widths
 
