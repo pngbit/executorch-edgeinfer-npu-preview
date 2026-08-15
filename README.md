@@ -1,275 +1,302 @@
-<div align="center">
-  <img src="docs/source/_static/img/et-logo.png" alt="ExecuTorch logo mark" width="200">
-  <h1>ExecuTorch</h1>
-  <p><strong>On-device AI inference powered by PyTorch</strong></p>
-</div>
+# EdgeInfer NPU for ExecuTorch
 
-<div align="center">
-  <a href="https://pypi.org/project/executorch/"><img src="https://img.shields.io/pypi/v/executorch?style=for-the-badge&color=blue" alt="PyPI - Version"></a>
-  <a href="https://github.com/pytorch/executorch/graphs/contributors"><img src="https://img.shields.io/github/contributors/pytorch/executorch?style=for-the-badge&color=blue" alt="GitHub - Contributors"></a>
-  <a href="https://github.com/pytorch/executorch/stargazers"><img src="https://img.shields.io/github/stars/pytorch/executorch?style=for-the-badge&color=blue" alt="GitHub - Stars"></a>
-  <a href="https://discord.gg/Dh43CKSAdc"><img src="https://img.shields.io/badge/Discord-Join%20Us-blue?logo=discord&logoColor=white&style=for-the-badge" alt="Discord - Chat with Us"></a>
-  <a href="https://docs.pytorch.org/executorch/main/index.html"><img src="https://img.shields.io/badge/Documentation-blue?logo=googledocs&logoColor=white&style=for-the-badge" alt="Documentation"></a>
-</div>
+[中文说明](README_zh_CN.md)
 
-> **EdgeInfer NPU Preview:** this fork adds opt-in, measured-cost
-> composition of static Attention graphs for long-context LLM inference on
-> Qualcomm NPUs. See the [English](docs/edgeinfer-npu/README.md) or
-> [Chinese](docs/edgeinfer-npu/README_zh_CN.md) deployment guide. The original
-> ExecuTorch paths remain the default when EdgeInfer is not explicitly enabled.
+This branch is an opt-in ExecuTorch extension for long-context LLM inference
+on Qualcomm NPUs. It keeps every delegated Attention graph static, profiles a
+finite portfolio of Query-row (`R`), internal Query-tile (`Q`), and K/V-width
+(`C`) shapes, and uses dynamic programming to select the lowest measured-cost
+composition for the current context.
 
-**ExecuTorch** is PyTorch's unified solution for deploying AI models on-device—from smartphones to microcontrollers—built for privacy, performance, and portability. It powers Meta's on-device AI across **Instagram, WhatsApp, Quest 3, Ray-Ban Meta Smart Glasses**, and [more](https://docs.pytorch.org/executorch/main/success-stories.html).
+The extension is incremental:
 
-Deploy **LLMs, vision, speech, and multimodal models** with the same PyTorch APIs you already know—accelerating research to production with seamless model export, optimization, and deployment. No manual C++ rewrites. No format conversions. No vendor lock-in.
+- the original Qualcomm `qnn_llama_runner` is still built and remains the
+  default;
+- EdgeInfer is compiled only with `EXECUTORCH_BUILD_EDGEINFER=ON`;
+- the production path is selected only when EdgeInfer PTE paths and their
+  shape contract are supplied;
+- initialization and execution failures use the original decoder-PTE fallback
+  before exposing partially updated K/V state.
 
-<details>
-  <summary><strong>📘 Table of Contents</strong></summary>
+## What It Adds
 
-- [Why ExecuTorch?](#why-executorch)
-- [How It Works](#how-it-works)
-- [Quick Start](#quick-start)
-  - [Installation](#installation)
-  - [Export and Deploy in 3 Steps](#export-and-deploy-in-3-steps)
-  - [Run on Device](#run-on-device)
-  - [LLM Example: Llama](#llm-example-llama)
-- [Platform & Hardware Support](#platform--hardware-support)
-- [Production Deployments](#production-deployments)
-- [Examples & Models](#examples--models)
-- [Key Features](#key-features)
-- [Documentation](#documentation)
-- [Community & Contributing](#community--contributing)
-- [License](#license)
+- AOT export of `attn_first_rR_cC` and `attn_merge_rR_cC` static methods.
+- Exact online-softmax state composition across one or more K/V blocks.
+- Measured-cost planning where one padded large graph and multi-graph
+  compositions compete in the same search space.
+- A persistent block-native K/V cache for Decode.
+- Chunked Prefill with a causal staircase: blocks wholly above the causal
+  boundary are skipped, while boundary blocks may use a small amount of
+  padding.
+- Independent Prefill and Decode portfolios, such as `R=32` for Prefill and
+  `R=1` for Decode.
+- Transactional rollback and a native ExecuTorch fallback path.
 
-</details>
+The exported portfolio has no compiled maximum-context field. Device memory,
+host memory, integer ranges, and application policy remain practical limits.
 
-## Why ExecuTorch?
+## Prerequisites
 
-- **🔒 Native PyTorch Export** — Direct export from PyTorch. No .onnx, .tflite, or intermediate format conversions. Preserve model semantics.
-- **⚡ Production-Proven** — Powers billions of users at [Meta with real-time on-device inference](https://engineering.fb.com/2025/07/28/android/executorch-on-device-ml-meta-family-of-apps/).
-- **💾 Tiny Runtime** — 50KB base footprint. Runs on microcontrollers to high-end smartphones.
-- **🚀 [12+ Hardware Backends](https://docs.pytorch.org/executorch/main/backends-overview.html)** — Open-source acceleration for Apple, Samsung, Qualcomm, ARM, MediaTek, Vulkan, and more.
-- **🎯 One Export, Multiple Backends** — Switch hardware targets with a single line change. Deploy the same model everywhere.
+- Linux development host.
+- A supported Qualcomm Android device and working `adb` connection.
+- Android NDK and a QAIRT/QNN SDK compatible with the device.
+- Python environment supported by the checked-out ExecuTorch revision.
+- `jq`, CMake, and a C++ build tool.
+- A compatible dense Llama-family checkpoint and its parameter JSON.
+- The original Qualcomm decoder PTE and tokenizer required by the standard
+  ExecuTorch Llama flow.
 
-## How It Works
-
-ExecuTorch uses **ahead-of-time (AOT) compilation** to prepare PyTorch models for edge deployment:
-
-1. **🧩 Export** — Capture your PyTorch model graph with `torch.export()`
-2. **⚙️ Compile** — Quantize, optimize, and partition to hardware backends → `.pte`
-3. **🚀 Execute** — Load `.pte` on-device via lightweight C++ runtime
-
-Models use a standardized [Core ATen operator set](https://docs.pytorch.org/executorch/main/compiler-ir-advanced.html#intermediate-representation). [Partitioners](https://docs.pytorch.org/executorch/main/compiler-delegate-and-partitioner.html) delegate subgraphs to specialized hardware (NPU/GPU) with CPU fallback.
-
-Learn more: [How ExecuTorch Works](https://docs.pytorch.org/executorch/main/intro-how-it-works.html) • [Architecture Guide](https://docs.pytorch.org/executorch/main/getting-started-architecture.html)
-
-## Quick Start
-
-### Installation
+Set up ExecuTorch and QAIRT first:
 
 ```bash
-pip install executorch
+git submodule sync --recursive
+git submodule update --init --recursive
+./install_executorch.sh --editable
+
+export ANDROID_NDK=/path/to/android-ndk
+export QNN_SDK_ROOT=/path/to/qairt
+export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LD_LIBRARY_PATH"
 ```
 
-For platform-specific setup (Android, iOS, embedded systems), see the [Quick Start](https://docs.pytorch.org/executorch/main/quick-start-section.html) documentation for additional info.
+The standard Qualcomm setup remains documented in
+[`docs/source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md`](../source/llm/build-run-llama3-qualcomm-ai-engine-direct-backend.md).
 
-### Export and Deploy in 3 Steps
+## 1. Select Candidate Widths
 
-```python
-import torch
-from executorch.exir import to_edge_transform_and_lower
-from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-
-# 1. Export your PyTorch model
-model = MyModel().eval()
-example_inputs = (torch.randn(1, 3, 224, 224),)
-exported_program = torch.export.export(model, example_inputs)
-
-# 2. Optimize for target hardware (switch backends with one line)
-program = to_edge_transform_and_lower(
-    exported_program,
-    partitioner=[XnnpackPartitioner()]  # CPU | CoreMLPartitioner() for iOS | QnnPartitioner() for Qualcomm
-).to_executorch()
-
-# 3. Save for deployment
-with open("model.pte", "wb") as f:
-    f.write(program.buffer)
-
-# Test locally via ExecuTorch runtime's pybind API (optional)
-from executorch.runtime import Runtime
-runtime = Runtime.get()
-method = runtime.load_program("model.pte").load_method("forward")
-outputs = method.execute([torch.randn(1, 3, 224, 224)])
-```
-
-### Run on Device
-
-**[C++](https://docs.pytorch.org/executorch/main/using-executorch-cpp.html)**
-```cpp
-#include <executorch/extension/module/module.h>
-#include <executorch/extension/tensor/tensor.h>
-
-Module module("model.pte");
-auto tensor = make_tensor_ptr({2, 2}, {1.0f, 2.0f, 3.0f, 4.0f});
-auto outputs = module.forward(tensor);
-```
-
-**[Swift (iOS)](https://docs.pytorch.org/executorch/main/ios-section.html)**
-```swift
-import ExecuTorch
-
-let module = Module(filePath: "model.pte")
-let input = Tensor<Float>([1.0, 2.0, 3.0, 4.0], shape: [2, 2])
-let outputs = try module.forward(input)
-```
-
-**[Kotlin (Android)](https://docs.pytorch.org/executorch/main/android-section.html)**
-```kotlin
-val module = Module.load("model.pte")
-val inputTensor = Tensor.fromBlob(floatArrayOf(1.0f, 2.0f, 3.0f, 4.0f), longArrayOf(2, 2))
-val outputs = module.forward(EValue.from(inputTensor))
-```
-
-### LLM Example: Llama
-
-Export Llama models using the [`export_llm`](https://docs.pytorch.org/executorch/main/llm/export-llm.html) script or [Optimum-ExecuTorch](https://github.com/huggingface/optimum-executorch):
+Candidate widths are positive powers of two. Probe them from the smallest
+shape required by the workload and stop after the first target-device resource
+limit. For a Qwen3-0.6B Attention geometry:
 
 ```bash
-# Using export_llm
-python -m executorch.extension.llm.export.export_llm --model llama3_2 --output llama.pte
-
-# Using Optimum-ExecuTorch
-optimum-cli export executorch \
-  --model meta-llama/Llama-3.2-1B \
-  --task text-generation \
-  --recipe xnnpack \
-  --output_dir llama_model
+python -m executorch.extension.llm.export.probe_composable_attention_widths \
+  --output-dir artifacts/probe-r1 \
+  --backend qnn \
+  --soc-model SM8650 \
+  --dtype fp16 \
+  --query-heads 16 \
+  --kv-heads 8 \
+  --query-rows 1 \
+  --head-dim 128 \
+  --start-width 1 \
+  --max-width 4096
 ```
 
-Run on-device with the LLM runner API:
+The probe records export time, PTE size, graph count, successful widths, and
+failure provenance in `width_probe_manifest.json`. A real deployment should
+also execute each successful shape on the target device before admitting it to
+the portfolio.
 
-**[C++](https://docs.pytorch.org/executorch/main/llm/run-with-c-plus-plus.html)**
-```cpp
-#include <executorch/extension/llm/runner/text_llm_runner.h>
+## 2. Export Prefill and Decode Portfolios
 
-auto runner = create_llama_runner("llama.pte", "tiktoken.bin");
-executorch::extension::llm::GenerationConfig config{
-    .seq_len = 128, .temperature = 0.8f};
-runner->generate("Hello, how are you?", config);
+Export the same model contract twice, with shapes appropriate to each phase.
+The following widths are examples; use the successful measured set for the
+target device. The original decoder PTE metadata `ar_len` must equal the
+primary Prefill `--query-rows` value (128 in this example).
+
+```bash
+COMMON_ARGS=(
+  --checkpoint /path/to/consolidated.00.pth
+  --params /path/to/params.json
+  --backend qnn
+  --soc-model SM8650
+  --dtype fp16
+  --pre-attention-rope
+)
+
+python -m executorch.examples.models.llama.export_composable_llama \
+  "${COMMON_ARGS[@]}" \
+  --query-rows 128 \
+  --prefill-query-rows 128 256 \
+  --widths 1 2 4 8 16 32 64 128 256 512 1024 \
+  --row-widths 128:1,2,4,8,16,32,64,128,256,512,1024 \
+               256:1,2,4,8,16,32,64,128,256,512 \
+  --row-query-tiles 128:32 256:32 \
+  --output artifacts/edgeinfer_prefill.pte
+
+python -m executorch.examples.models.llama.export_composable_llama \
+  "${COMMON_ARGS[@]}" \
+  --query-rows 1 \
+  --widths 1024 4096 \
+  --output artifacts/edgeinfer_decode_r1.pte
 ```
 
-**[Swift (iOS)](https://docs.pytorch.org/executorch/main/llm/run-on-ios.html)**
-```swift
-import ExecuTorchLLM
+Keep each `.pte.json` file beside its PTE. It records export wall time, graph
+count, PTE count and size, methods, dimensions, RoPE contract, and widths.
 
-let runner = TextRunner(modelPath: "llama.pte", tokenizerPath: "tiktoken.bin")
-try runner.generate("Hello, how are you?", Config {
-    $0.sequenceLength = 128
-}) { token in
-    print(token, terminator: "")
-}
+Validate the two contracts before deployment:
+
+```bash
+PREFILL_MANIFEST=artifacts/edgeinfer_prefill.pte.json
+DECODE_MANIFEST=artifacts/edgeinfer_decode_r1.pte.json
+
+test "$(jq -r '.query_rows' "$DECODE_MANIFEST")" = 1
+for field in dim layers query_heads kv_heads head_dim vocab_size rope_theta rope_style; do
+  test "$(jq -r ".$field" "$PREFILL_MANIFEST")" = \
+       "$(jq -r ".$field" "$DECODE_MANIFEST")"
+done
+
+PREFILL_WIDTHS="$(jq -r '.widths | join(",")' "$PREFILL_MANIFEST")"
+DECODE_WIDTHS="$(jq -r '.widths | join(",")' "$DECODE_MANIFEST")"
 ```
 
-**Kotlin (Android)** — [API Docs](https://docs.pytorch.org/executorch/main/javadoc/org/pytorch/executorch/extension/llm/package-summary.html) • [Demo App](https://github.com/meta-pytorch/executorch-examples/tree/main/llm/android/LlamaDemo)
-```kotlin
-val llmModule = LlmModule("llama.pte", "tiktoken.bin", 0.8f)
-llmModule.load()
-llmModule.generate("Hello, how are you?", 128, object : LlmCallback {
-    override fun onResult(result: String) { print(result) }
-    override fun onStats(stats: String) { }
-})
+Do not pass the union of both width sets to both PTEs. Every declared width
+must have matching first and merge methods in the corresponding PTE.
+
+## 3. Build Android Libraries and Runners
+
+Build and install the ExecuTorch Android libraries:
+
+```bash
+export ET_ANDROID_BUILD="$PWD/cmake-out-edgeinfer-android"
+
+cmake -S . -B "$ET_ANDROID_BUILD" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$ET_ANDROID_BUILD" \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-30 \
+  -DEXECUTORCH_BUILD_QNN=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON \
+  -DEXECUTORCH_BUILD_EDGEINFER=ON \
+  -DQNN_SDK_ROOT="$QNN_SDK_ROOT"
+
+cmake --build "$ET_ANDROID_BUILD" --target install -j
 ```
 
-For multimodal models (vision, audio), use the [MultiModal runner API](extension/llm/runner) which extends the LLM runner to handle image and audio inputs alongside text. See [Llava](examples/models/llava/README.md) and [Voxtral](examples/models/voxtral/README.md) examples.
+Build the Qualcomm examples against that installation:
 
-See [examples/models/llama](examples/models/llama/README.md) for complete workflow including quantization, mobile deployment, and advanced options.
+```bash
+cmake -S examples/qualcomm \
+  -B "$ET_ANDROID_BUILD/examples/qualcomm" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-30 \
+  -DCMAKE_PREFIX_PATH="$ET_ANDROID_BUILD/lib/cmake/ExecuTorch;$ET_ANDROID_BUILD/third-party/gflags;$ET_ANDROID_BUILD/lib/cmake/absl" \
+  -DEXECUTORCH_BUILD_EDGEINFER=ON \
+  -DQNN_SDK_ROOT="$QNN_SDK_ROOT"
 
-**Next Steps:**
-- 📖 [Step-by-step tutorial](https://docs.pytorch.org/executorch/main/getting-started.html) — Complete walkthrough for your first model
-- ⚡ [Colab notebook](https://colab.research.google.com/drive/1qpxrXC3YdJQzly3mRg-4ayYiOjC6rue3?usp=sharing) — Try ExecuTorch instantly in your browser
-- 🤖 [Deploy Llama models](examples/models/llama/README.md) — LLM workflow with quantization and mobile demos
-
-## Platform & Hardware Support
-
-| **Platform**     | **Supported Backends**                                   |
-|------------------|----------------------------------------------------------|
-| Android          | XNNPACK, Vulkan, Qualcomm, MediaTek, Samsung Exynos      |
-| iOS              | XNNPACK, CoreML (Neural Engine), MPS *(deprecated)*      |
-| Linux / Windows  | XNNPACK, OpenVINO, CUDA *(experimental)*                 |
-| macOS            | XNNPACK, Metal *(experimental)*, MPS *(deprecated)*      |
-| Embedded / MCU   | XNNPACK, ARM Ethos-U, NXP, Cadence DSP                   |
-
-See [Backend Documentation](https://docs.pytorch.org/executorch/main/backends-overview.html) for detailed hardware requirements and optimization guides. For desktop/laptop GPU inference with CUDA and Metal, see the [Desktop Guide](desktop/README.md). For Zephyr RTOS integration, see the [Zephyr Guide](zephyr/README.md).
-
-## Production Deployments
-
-ExecuTorch powers on-device AI at scale across Meta's family of apps, VR/AR devices, and partner deployments. [View success stories →](https://docs.pytorch.org/executorch/main/success-stories.html)
-
-## Examples & Models
-
-**LLMs:** [Llama 3.2/3.1/3](examples/models/llama/README.md), [Qwen 3](examples/models/qwen3/README.md), [Phi-4-mini](examples/models/phi_4_mini/README.md), [LiquidAI LFM2](examples/models/lfm2/README.md)
-
-**Multimodal:** [Llava](examples/models/llava/README.md) (vision-language), [Voxtral](examples/models/voxtral/README.md) (audio-language), [Gemma](examples/models/gemma3) (vision-language)
-
-**Vision/Speech:** [MobileNetV2](https://github.com/meta-pytorch/executorch-examples/tree/main/mv2), [DeepLabV3](https://github.com/meta-pytorch/executorch-examples/tree/main/dl3), [YOLO26](examples/models/yolo26/README.md), [Whisper](examples/models/whisper/README.md) <!-- @lint-ignore -->
-
-**Resources:** [`examples/`](examples/) directory • [executorch-examples](https://github.com/meta-pytorch/executorch-examples) out-of-tree demos • [Optimum-ExecuTorch](https://github.com/huggingface/optimum-executorch) for HuggingFace models • [Unsloth](https://docs.unsloth.ai/new/deploy-llms-phone) for fine-tuned LLM deployment <!-- @lint-ignore -->
-
-## Key Features
-
-ExecuTorch provides advanced capabilities for production deployment:
-
-- **Quantization** — Built-in support via [torchao](https://docs.pytorch.org/ao) for 8-bit, 4-bit, and dynamic quantization
-- **Memory Planning** — Optimize memory usage with ahead-of-time allocation strategies
-- **Developer Tools** — ETDump profiler, ETRecord inspector, and model debugger
-- **Selective Build** — Strip unused operators to minimize binary size
-- **Custom Operators** — Extend with domain-specific kernels
-- **Dynamic Shapes** — Support variable input sizes with bounded ranges
-
-See [Advanced Topics](https://docs.pytorch.org/executorch/main/advanced-topics-section.html) for quantization techniques, custom backends, and compiler passes.
-
-## Documentation
-
-- [**Documentation Home**](https://docs.pytorch.org/executorch/main/index.html) — Complete guides and tutorials
-- [**API Reference**](https://docs.pytorch.org/executorch/main/api-section.html) — Python, C++, Java/Kotlin APIs
-- [**Backend Integration**](https://docs.pytorch.org/executorch/main/backend-delegates-integration.html) — Build custom hardware backends
-- [**Troubleshooting**](https://docs.pytorch.org/executorch/main/support-section.html) — Common issues and solutions
-
-## Community & Contributing
-
-We welcome contributions from the community!
-
-- 💬 [**GitHub Discussions**](https://github.com/pytorch/executorch/discussions) — Ask questions and share ideas
-- 🎮 [**Discord**](https://discord.gg/Dh43CKSAdc) — Chat with the team and community
-- 🐛 [**Issues**](https://github.com/pytorch/executorch/issues) — Report bugs or request features
-- 🤝 [**Contributing Guide**](CONTRIBUTING.md) — Guidelines and codebase structure
-
-## Citing ExecuTorch
-
-If you found ExecuTorch helpful in your research and would like to acknowledge it, please cite us using the following BibTeX:
-
-```bibtex
-@article{executorch2026,
-    title={{ExecuTorch} - A Unified {PyTorch} Solution to Run {AI} Models On-Device},
-    author={Nachin, Mergen and Desai, Digant and Jia, Sicheng Stephen and Lai, Chen and Liu, Mengwei and Szwejbka, Jacob and Alvarez, Raziel and Ascani, RJ and Bort, Dave and Candales, Manuel and
-  others},
-    journal={arXiv preprint arXiv:2605.08195},
-    url={https://github.com/pytorch/executorch},
-    year={2026}
-  }
+cmake --build "$ET_ANDROID_BUILD/examples/qualcomm" --target \
+  qnn_llama_runner qnn_llama_runner_edgeinfer \
+  qnn_composable_attention_runner -j
 ```
 
-## License
+Building `qnn_llama_runner` in the same tree verifies that the original path is
+still available. `qnn_llama_runner_edgeinfer` is the opt-in executable.
 
-ExecuTorch is BSD licensed, as found in the [LICENSE](LICENSE) file.
+## 4. Deploy
 
-<br><br>
+Create a device directory and push:
 
----
+- `qnn_llama_runner_edgeinfer`;
+- the original decoder PTE;
+- Prefill and Decode EdgeInfer PTEs;
+- tokenizer or tokenized prompt input;
+- `libqnn_executorch_backend.so`;
+- the QNN HTP/System stub libraries and the matching DSP skeleton required by
+  the target SoC.
 
-<div align="center">
-  <p><strong>Part of the PyTorch ecosystem</strong></p>
-  <p>
-    <a href="https://github.com/pytorch/executorch">GitHub</a> •
-    <a href="https://docs.pytorch.org/executorch">Documentation</a>
-  </p>
-</div>
+Example skeleton:
+
+```bash
+SERIAL=device-serial
+DEVICE_DIR=/data/local/tmp/edgeinfer-npu
+
+adb -s "$SERIAL" shell "mkdir -p '$DEVICE_DIR'"
+adb -s "$SERIAL" push \
+  "$ET_ANDROID_BUILD/examples/qualcomm/oss_scripts/llama/qnn_llama_runner_edgeinfer" \
+  artifacts/edgeinfer_prefill.pte \
+  artifacts/edgeinfer_decode_r1.pte \
+  /path/to/decoder_baseline.pte \
+  /path/to/tokenizer.bin \
+  "$DEVICE_DIR/"
+```
+
+Follow the standard Qualcomm guide for the exact runtime and DSP library set.
+Do not publish proprietary QAIRT libraries in the Git repository.
+
+## 5. Run
+
+Read every runner flag from the Prefill or Decode manifest instead of typing
+shape metadata manually:
+
+```bash
+EDGEINFER_LAYERS="$(jq -r '.layers' "$PREFILL_MANIFEST")"
+EDGEINFER_DIM="$(jq -r '.dim' "$PREFILL_MANIFEST")"
+EDGEINFER_QUERY_HEADS="$(jq -r '.query_heads' "$PREFILL_MANIFEST")"
+EDGEINFER_KV_HEADS="$(jq -r '.kv_heads' "$PREFILL_MANIFEST")"
+EDGEINFER_HEAD_DIM="$(jq -r '.head_dim' "$PREFILL_MANIFEST")"
+EDGEINFER_VOCAB_SIZE="$(jq -r '.vocab_size' "$PREFILL_MANIFEST")"
+EDGEINFER_ROPE_THETA="$(jq -r '.rope_theta' "$PREFILL_MANIFEST")"
+EDGEINFER_ROPE_STYLE="$(jq -r '.rope_style' "$PREFILL_MANIFEST")"
+
+adb -s "$SERIAL" shell <<EOF
+cd "$DEVICE_DIR"
+export LD_LIBRARY_PATH="$DEVICE_DIR"
+export ADSP_LIBRARY_PATH="$DEVICE_DIR"
+
+./qnn_llama_runner_edgeinfer \
+  --model_path=decoder_baseline.pte \
+  --tokenizer_path=tokenizer.bin \
+  --decoder_model_version=llama2 \
+  --prompt="Once upon a time" \
+  --seq_len=256 \
+  --eval_mode=1 \
+  --temperature=0 \
+  --edgeinfer_composable_model_path=edgeinfer_prefill.pte \
+  --edgeinfer_decode_model_path=edgeinfer_decode_r1.pte \
+  --edgeinfer_widths="$PREFILL_WIDTHS" \
+  --edgeinfer_decode_widths="$DECODE_WIDTHS" \
+  --edgeinfer_layers="$EDGEINFER_LAYERS" \
+  --edgeinfer_dim="$EDGEINFER_DIM" \
+  --edgeinfer_query_heads="$EDGEINFER_QUERY_HEADS" \
+  --edgeinfer_kv_heads="$EDGEINFER_KV_HEADS" \
+  --edgeinfer_head_dim="$EDGEINFER_HEAD_DIM" \
+  --edgeinfer_vocab_size="$EDGEINFER_VOCAB_SIZE" \
+  --edgeinfer_rope_theta="$EDGEINFER_ROPE_THETA" \
+  --edgeinfer_rope_style="$EDGEINFER_ROPE_STYLE" \
+  --edgeinfer_pre_attention_rope=true \
+  --edgeinfer_profile_warmup=1 \
+  --edgeinfer_profile_iterations=3
+EOF
+```
+
+For deterministic benchmarking, a tokenized prompt may be supplied instead of
+`--prompt`. Keep the baseline and EdgeInfer runs on the same model, precision,
+input, device, thermal state, warmup policy, and timing boundary.
+
+## 6. Confirm EdgeInfer Actually Executed
+
+Exit code zero is insufficient because a rejected portfolio intentionally
+falls back to the original path. Preserve the unfiltered log and require:
+
+```text
+EdgeInfer Prefill persistent KV plan
+EdgeInfer Prefill causal staircase
+EdgeInfer Prefill completed through split QKV/Attention/Post graphs
+EdgeInfer split Decode is enabled
+EdgeInfer Decode token position=...
+```
+
+`unavailable before cache mutation` means the request used the original
+decoder-PTE fallback. The sentence saying that the original path *remains* a
+fallback is informational and does not mean fallback ran.
+
+Common causes of an early fallback are:
+
+- a width declared on the command line is absent from the matching PTE;
+- Prefill and Decode manifests describe different model geometry;
+- an incorrect RoPE style or model dimension was supplied;
+- a required QNN runtime or DSP library is missing;
+- the selected PTE is incompatible with the target SoC.
+
+## Repository Policy
+
+Commit source, tests, scripts, manifests without proprietary data, and concise
+reproduction metadata. Do not commit QAIRT packages, model weights, generated
+PTE/DLC files, Android build trees, or large raw logs. This fork retains the
+upstream ExecuTorch BSD license; users are responsible for the licenses of
+models and vendor SDKs.
